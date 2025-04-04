@@ -177,6 +177,7 @@ def save_to_excel(data, filename):
             "ИСКОВЫЕ ТРЕБОВАНИЯ": case.get('iskov', ''),
             "Итоговый судебный акт": case.get('itog', ''),
             "Хронология": case.get('chronology', ''),
+            "PDF_link": case.get('pdf_link', ''),
             "Установил": case.get('established', ''),
             "Определил": case.get('determined', ''),
             "PDF": case.get('full', '')
@@ -209,23 +210,21 @@ def get_chronology_data(code):
                 case_result_text = case_result.get_text(strip=True) if case_result else "Нет данных"
 
                 # Поиск ссылки на PDF
-                case_pdf = None
                 if h2:
                     pdf_link = h2.find("a", class_="js-case-result-text--doc_link", href=True)
                     # if pdf_link and "О принятии" in pdf_link.get_text(strip=True):
-                    if pdf_link and case_type == "Определение":
-                        case_pdf = extract_text_from_pdf(pdf_link["href"])
-                        if case_pdf:
-                            case_data["established"] = case_pdf["established"]
-                            case_data["determined"] = case_pdf["determined"]
-                            case_data["full"] = case_pdf["pdf_link"]
+                    if pdf_link and case_pdf is None:
+                        if "определение" in case_type.lower():
+                            case_pdf = extract_text_from_pdf(pdf_link["href"])
             else:
                 case_subject = case_result_text = "Нет данных"
 
             cases.append(f"{case_date} / {case_type} / {case_subject} / {case_result_text}")
-            case_data = {
-                "chronology": "\n".join(cases),
-            }
+        case_data = {
+            "chronology": "\n".join(cases),
+            "pdf": case_pdf
+        }
+        print("Данные хронологии получены")
     except Exception as e:
         print(f"Ошибка get_chronology_data(): {str(e)}")
 
@@ -292,14 +291,16 @@ def get_case_data(case_url):
                     # Парсим информацию из хронологии
                     chronology_data = get_chronology_data(chrono_list_content.get_attribute("outerHTML"))
                     if chronology_data:
-                        if 'chronology' in chronology_data and chronology_data['chronology']:
+                        if 'chronology' in chronology_data:
                             case['chronology'] = chronology_data['chronology']
-                        if 'established' in chronology_data and chronology_data['established']:
-                            case['established'] = chronology_data['established']
-                        if 'determined' in chronology_data and chronology_data['determined']:
-                            case['determined'] = chronology_data['determined']
-                        if 'full' in chronology_data and chronology_data['full']:
-                            case['full'] = chronology_data['full']
+                        if 'pdf' in chronology_data and 'established' in chronology_data['pdf']:
+                            case['established'] = chronology_data['pdf']['established']
+                        if 'pdf' in chronology_data and 'determined' in chronology_data['pdf']:
+                            case['determined'] = chronology_data['pdf']['determined']
+                        if 'pdf' in chronology_data and 'pdf_link' in chronology_data['pdf']:
+                            case['pdf_link'] = chronology_data['pdf']['pdf_link']
+                        if 'pdf' in chronology_data and 'full' in chronology_data['pdf']:
+                            case['full'] = chronology_data['pdf']['full']
 
         except Exception as e:
             print(f"Ошибка загрузки хронологии: {str(e)}")
@@ -418,12 +419,12 @@ def parse_and_send_file(message):
 if __name__ == "__main__":
     # url = "https://kad.arbitr.ru/Card/878c21b7-c8f1-4f99-a047-6893407866d9"
     # parse_case_info(url)
-    participant_number = '1659128597'
-    get_case_info(participant_number)
-    # while True:
-    #     print("Bot is starting...")
-    #     try:
-    #         bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
-    #     except Exception as e:
-    #         logging.error(f"Ошибка в работе бота: {e}")
-    #         time.sleep(5)  # Даем паузу перед повторным запуском
+    # participant_number = '1659128597'
+    # get_case_info(participant_number)
+    while True:
+        print("Bot is starting...")
+        try:
+            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            logging.error(f"Ошибка в работе бота: {e}")
+            time.sleep(5)  # Даем паузу перед повторным запуском
