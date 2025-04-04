@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 import re
 import threading
@@ -21,6 +22,7 @@ import re
 import json
 import pdfplumber
 from telebot import types
+import sqlite3
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +34,7 @@ bot = telebot.TeleBot(TOKEN)
 # Флаг блокировки выполнения задачи
 is_parsing = False
 lock = threading.Lock()
+DB_PATH = 'parser.db'
 
 def init_driver(download_folder):
     options = Options()
@@ -60,18 +63,6 @@ def normalize_keyword(keyword):
     """ Создает регулярное выражение для поиска ключевых слов с пробелами между буквами. """
     spaced_keyword = " ".join(keyword)  # "УСТАНОВИЛ" → "У С Т А Н О В И Л"
     return rf"(?:{keyword}:|{spaced_keyword}:)"  # Учитываем двоеточие сразу после слова
-
-# Функция для очистки имени файла от недопустимых символов
-def sanitize_filename(filename):
-    return re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)  # Заменяем запрещённые символы
-
-# Извлечение даты из строки
-def extract_date(text):
-    # Ищем дату в формате "ДД.ММ.ГГГГ"
-    match = re.search(r"\d{2}\.\d{2}\.\d{4}", text)
-    if match:
-        return match.group(0)
-    return "Нет даты"
 
 def download_file_ics_by_url(url):
     driver = None
@@ -160,79 +151,104 @@ def extract_text_from_pdf(url):
             print("Закрываем WebDriver...")
             driver.quit()  # Безопасное закрытие WebDriver
 
+# Функция для очистки имени файла от недопустимых символов
+def sanitize_filename(filename):
+    return re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)  # Заменяем запрещённые символы
+
+
+# Извлечение даты из строки
+def extract_date(text):
+    # Ищем дату в формате "ДД.ММ.ГГГГ"
+    match = re.search(r"\d{2}\.\d{2}\.\d{4}", text)
+    if match:
+        return match.group(0)
+    return "Нет даты"
+
 # Сохранение данных в Excel
-def save_to_excel(data, filename):
-    filename = sanitize_filename(filename)  # Очищаем имя файла
-    filepath = os.path.join(SAVE_PATH, filename)
+def save_to_db(data):
+    # Открываем соединение с базой данных
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-    # Преобразуем данные в pandas DataFrame
-    formatted_data = []
+    # Получаем текущую дату и время для поля "Дата добавления"
+    current_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Перебираем данные и вставляем их в базу
     for case in data:
-        formatted_data.append({
-            "Дело": f"{case.get('case-date', 'Нет данных')} {case.get('case_number', 'Нет данных')}",
-            "Юрист": "",  # Оставляем поле пустым
-            "Следующее заседание": case.get('next_hearing', 'Нет даты'),
-            "Истцы": case.get('plaintiff', 'Не указаны'),
-            "Ответчики": case.get('defendant', 'Не указаны'),
-            "ИСКОВЫЕ ТРЕБОВАНИЯ": case.get('iskov', ''),
-            "Итоговый судебный акт": case.get('itog', ''),
-            "Хронология": case.get('chronology', ''),
-            "Установил": case.get('established', ''),
-            "Определил": case.get('determined', ''),
-            "PDF": case.get('full', '')
-        })
+        cursor.execute("""
+            INSERT INTO cases (
+                case_date, case_number, lawyer, next_hearing, plaintiff, defendant,
+                iskod, final_judgment, chronology, established, determined, pdf, added_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            case.get('case-date', 'Нет данных'),  # Отдельно дата
+            case.get('case_number', 'Нет данных'),  # Отдельно номер дела
+            "",  # Юрист оставляем пустым
+            case.get('next_hearing', 'Нет даты'),
+            case.get('plaintiff', 'Не указаны'),
+            case.get('defendant', 'Не указаны'),
+            case.get('iskov', ''),
+            case.get('itog', ''),
+            case.get('chronology', ''),
+            case.get('established', ''),
+            case.get('determined', ''),
+            case.get('full', ''),
+            current_datetime  # Дата добавления
+        ))
 
-    df = pd.DataFrame(formatted_data)
-    df.to_excel(filepath, index=False)  # Сохраняем файл Excel
-    return filepath
+    # Сохраняем изменения и закрываем соединение
+    conn.commit()
+    conn.close()
 
-def get_chronology_data(code):
+def case_pdf_url(url):
+    result = extract_text_from_pdf(url)
+    if not result:
+        print("Повторная попытка загрузки файла...")
+        result = extract_text_from_pdf(url)
+    return result
+
+def pars_additional_data(code):
     soup = BeautifulSoup(code, "html.parser")
     cases = []
     case_data = {}
     case_pdf = None
-    try:
-        for item in soup.find_all("div", class_="b-chrono-item"):
-            case_date = item.find("p", class_="case-date")
-            case_type = item.find("p", class_="case-type")
+    for item in soup.find_all("div", class_="b-chrono-item"):
+        case_date = item.find("p", class_="case-date")
+        case_type = item.find("p", class_="case-type")
 
-            case_date = case_date.get_text(strip=True) if case_date else "Нет данных"
-            case_type = case_type.get_text(strip=True) if case_type else "Нет данных"
+        case_date = case_date.get_text(strip=True) if case_date else "Нет данных"
+        case_type = case_type.get_text(strip=True) if case_type else "Нет данных"
 
-            r_col = item.find("div", class_="r-col")
+        r_col = item.find("div", class_="r-col")
 
-            if r_col:
-                case_subject = r_col.find("p", class_="case-subject")
-                case_result = r_col.find("span", class_="js-judges-rollover")
-                h2 = r_col.find("h2", class_="b-case-result")
-                case_subject = case_subject.get_text(strip=True) if case_subject else "Нет данных"
-                case_result_text = case_result.get_text(strip=True) if case_result else "Нет данных"
+        if r_col:
+            case_subject = r_col.find("p", class_="case-subject")
+            case_result = r_col.find("span", class_="js-judges-rollover")
+            h2 = r_col.find("h2", class_="b-case-result")
+            case_subject = case_subject.get_text(strip=True) if case_subject else "Нет данных"
+            case_result_text = case_result.get_text(strip=True) if case_result else "Нет данных"
 
-                # Поиск ссылки на PDF
-                case_pdf = None
-                if h2:
-                    pdf_link = h2.find("a", class_="js-case-result-text--doc_link", href=True)
-                    # if pdf_link and "О принятии" in pdf_link.get_text(strip=True):
-                    if pdf_link and case_type == "Определение":
-                        case_pdf = extract_text_from_pdf(pdf_link["href"])
-                        if case_pdf:
-                            case_data["established"] = case_pdf["established"]
-                            case_data["determined"] = case_pdf["determined"]
-                            case_data["full"] = case_pdf["pdf_link"]
-            else:
-                case_subject = case_result_text = "Нет данных"
+            # Поиск ссылки на PDF
+            if h2:
+                pdf_link = h2.find("a", href=True)
+                if pdf_link and "О принятии искового заявления" in pdf_link.get_text(strip=True):
+                    case_pdf = case_pdf_url(pdf_link["href"])
+        else:
+            case_subject = case_result_text = "Нет данных"
 
-            cases.append(f"{case_date} / {case_type} / {case_subject} / {case_result_text}")
-            case_data = {
-                "chronology": "\n".join(cases),
-            }
-    except Exception as e:
-        print(f"Ошибка get_chronology_data(): {str(e)}")
+        cases.append(f"{case_date} / {case_type} / {case_subject} / {case_result_text}")
+        case_data = {
+            "chronology": "\n".join(cases),
+        }
+        if case_pdf:
+            case_data["established"] = case_pdf["established"]
+            case_data["determined"] = case_pdf["determined"]
+            case_data["full"] = case_pdf["pdf_link"]
 
     return case_data
 
 # Парсинг информации по делу
-def get_case_data(case_url):
+def parse_case_info(case_url):
     driver = None
     try:
         driver = init_driver("downloads")
@@ -278,28 +294,21 @@ def get_case_data(case_url):
                 EC.element_to_be_clickable((By.CSS_SELECTOR, ".b-collapse.js-collapse"))
             )
             plus_button.click()
-            time.sleep(3)
-            chrono_list_content = WebDriverWait(driver, 45).until(
+            time.sleep(2)
+            code = WebDriverWait(driver, 45).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "#chrono_list_content"))
             )
-            # Ожидаем появления блока chrono_list_content
-            if chrono_list_content:
-                b_chrono_item = WebDriverWait(driver, 45).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".b-chrono-item"))
-                )
-                # Ожидаем появления первого элемента .b-chrono-item
-                if b_chrono_item:
-                    # Парсим информацию из хронологии
-                    chronology_data = get_chronology_data(chrono_list_content.get_attribute("outerHTML"))
-                    if chronology_data:
-                        if 'chronology' in chronology_data and chronology_data['chronology']:
-                            case['chronology'] = chronology_data['chronology']
-                        if 'established' in chronology_data and chronology_data['established']:
-                            case['established'] = chronology_data['established']
-                        if 'determined' in chronology_data and chronology_data['determined']:
-                            case['determined'] = chronology_data['determined']
-                        if 'full' in chronology_data and chronology_data['full']:
-                            case['full'] = chronology_data['full']
+
+            aditional_data = pars_additional_data(code.get_attribute("outerHTML"))
+            if aditional_data:
+                if 'chronology' in aditional_data and aditional_data['chronology']:
+                    case['chronology'] = aditional_data['chronology']
+                if 'established' in aditional_data and aditional_data['established']:
+                    case['established'] = aditional_data['established']
+                if 'determined' in aditional_data and aditional_data['determined']:
+                    case['determined'] = aditional_data['determined']
+                if 'full' in aditional_data and aditional_data['full']:
+                    case['full'] = aditional_data['full']
 
         except Exception as e:
             print(f"Ошибка загрузки хронологии: {str(e)}")
@@ -312,6 +321,7 @@ def get_case_data(case_url):
     finally:
         if driver:
             driver.quit()
+
 
 # Функция для получения информации о делах для участника
 def get_case_info(participant_number):
@@ -364,7 +374,7 @@ def get_case_info(participant_number):
             return [{"error": "Дела не найдены"}]
 
         logging.info(f"Найдено дел: {len(case_links)}")
-        case_info = [get_case_data(url) for url in case_links]
+        case_info = [parse_case_info(url) for url in case_links]
         return case_info
     except Exception as e:
         return [{"error": f"Ошибка: {str(e)}"}]
@@ -402,11 +412,11 @@ def parse_and_send_file(message):
         if "error" in case_info[0]:
             bot.send_message(message.chat.id, case_info[0]["error"])
         else:
-            filename = f"cases_{sanitize_filename(participant_query)}.xlsx"
-            file_path = save_to_excel(case_info, filename)
-
-            with open(file_path, "rb") as file:
-                bot.send_document(message.chat.id, file, caption="📂 Ваш файл с делами готов!")
+            # filename = f"cases_{sanitize_filename(participant_query)}.xlsx"
+            file_path = save_to_db(case_info)
+            bot.send_message(message.chat.id, f"📂 Ваш файл с делами готов и сохранен в базе!")
+            # with open(file_path, "rb") as file:
+            #     bot.send_document(message.chat.id, file, caption="📂 Ваш файл с делами готов!")
 
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
@@ -416,14 +426,9 @@ def parse_and_send_file(message):
 
 
 if __name__ == "__main__":
-    # url = "https://kad.arbitr.ru/Card/878c21b7-c8f1-4f99-a047-6893407866d9"
-    # parse_case_info(url)
-    participant_number = '1659128597'
-    get_case_info(participant_number)
-    # while True:
-    #     print("Bot is starting...")
-    #     try:
-    #         bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
-    #     except Exception as e:
-    #         logging.error(f"Ошибка в работе бота: {e}")
-    #         time.sleep(5)  # Даем паузу перед повторным запуском
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            logging.error(f"Ошибка в работе бота: {e}")
+            time.sleep(5)  # Даем паузу перед повторным запуском
